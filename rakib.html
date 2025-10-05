@@ -1,304 +1,65 @@
-"""
-Telegram Referral & Earning Bot - single file
-Filename: telegram_referral_bot.py
-Language: Python 3.9+
-Requirements:
-  pip install python-telegram-bot==13.19 peewee
-
-Features implemented:
-  - /start [referrer_id] : register user, track referral
-  - /referral : show user's referral link and stats
-  - /balance : show balance
-  - /earn : simulate an earning action (user gets small credit)
-  - /withdraw <amount> <payment_info> : request withdrawal
-  - /withdrawals : (admin) list pending withdrawals
-  - /approve <withdrawal_id> : (admin) approve and mark as paid
-  - /help : help menu
-
-Notes:
-  - Replace BOT_TOKEN and ADMIN_ID before running.
-  - This is a minimal demo for educational / prototype use. Replace simulated "earn" action with real ad/click tracking or 3rd-party integrations when you deploy.
-  - Keep your BOT_TOKEN secret.
-
-Usage:
-  1. Set BOT_TOKEN and ADMIN_ID environment variables or edit below.
-  2. Run: python telegram_referral_bot.py
-  3. Share referral link format: https://t.me/<YourBotUsername>?start=<user_id>
-
-Database: uses SQLite (bot_data.db) in same folder.
-"""
-
-import os
-import logging
-import sqlite3
-from datetime import datetime
-from functools import wraps
-
-from telegram import Update, ParseMode
-from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
-
-# --------- CONFIGURATION (edit these) ----------
-BOT_TOKEN = os.getenv('BOT_TOKEN') or 'REPLACE_WITH_YOUR_BOT_TOKEN'
-ADMIN_ID = int(os.getenv('ADMIN_ID') or '123456789')  # change to your Telegram user id
-DB_PATH = 'bot_data.db'
-EARN_AMOUNT = 5  # credits given per /earn (demo)
-CURRENCY = '৳'  # you can change to $ or others
-# -----------------------------------------------
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ---------- Simple SQLite helpers ---------------
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            referred_by INTEGER,
-            referrals INTEGER DEFAULT 0,
-            balance REAL DEFAULT 0,
-            created_at TEXT
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS earnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount REAL,
-            reason TEXT,
-            created_at TEXT
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount REAL,
-            payment_info TEXT,
-            status TEXT DEFAULT 'pending',
-            requested_at TEXT,
-            processed_at TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-
-def db_execute(query, params=()):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    lastrowid = cur.lastrowid
-    conn.close()
-    return lastrowid
-
-
-def db_query(query, params=()):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(query, params)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-# ---------- Decorator for admin-only commands ----------
-def admin_only(func):
-    @wraps(func)
-    def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id != ADMIN_ID:
-            update.message.reply_text('এই কমান্ডটি শুধুমাত্র অ্যাডমিন ব্যবহার করতে পারবেন।')
-            return
-        return func(update, context, *args, **kwargs)
-    return wrapped
-
-# ---------- Bot command handlers ----------------
-
-def start(update: Update, context: CallbackContext):
-    user = update.effective_user
-    args = context.args
-    referrer = None
-    if args:
-        try:
-            referrer = int(args[0])
-        except:
-            referrer = None
-
-    # create or update user
-    created_at = datetime.utcnow().isoformat()
-    rows = db_query('SELECT * FROM users WHERE user_id=?', (user.id,))
-    if not rows:
-        db_execute('INSERT INTO users (user_id, username, full_name, referred_by, created_at) VALUES (?,?,?,?,?)',
-                   (user.id, user.username or '', user.full_name or '', referrer, created_at))
-        # increment referrer's count and give bonus if applicable
-        if referrer and referrer != user.id:
-            db_execute('UPDATE users SET referrals = referrals + 1 WHERE user_id=?', (referrer,))
-            # optional bonus for referrer
-            bonus = 10
-            db_execute('UPDATE users SET balance = balance + ? WHERE user_id=?', (bonus, referrer))
-            db_execute('INSERT INTO earnings (user_id, amount, reason, created_at) VALUES (?,?,?,?)', (referrer, bonus, 'referral bonus', created_at))
-            try:
-                context.bot.send_message(chat_id=referrer, text=f'আপনার রেফার করে নতুন ব্যবহারকারী যোগ হয়েছে — বোনাস {bonus} {CURRENCY} যোগ হয়েছে।')
-            except Exception as e:
-                logger.warning('can't message referrer: %s', e)
-
-        update.message.reply_text('স্বাগতম! আপনার একাউন্ট তৈরি করা হয়েছে। /help দেখে নিন।')
-    else:
-        update.message.reply_text('আপনি আগেই রেজিস্টার করা আছেন। /help টিপুন।')
-
-    # show referral link tip
-    bot_username = context.bot.username
-    ref_link = f'https://t.me/{bot_username}?start={user.id}'
-    update.message.reply_text(f'আপনার রেফারাল লিংক: {ref_link}\nShare করে আয় বাড়ান!')
-
-
-def help_cmd(update: Update, context: CallbackContext):
-    txt = (
-        '/referral - আপনার রেফারাল লিংক ও স্ট্যাটস
-        /balance - আপনার ব্যালেন্স দেখুন
-        /earn - ডেমো আর্ন (টেস্টের জন্য)\n        /withdraw <amount> <payment_info> - উইথড্র পেতে অনুরোধ
-        /help - এই মেসেজটি দেখুন\n
-        অ্যাডমিন: /withdrawals , /approve <withdrawal_id>
-    ')
-    update.message.reply_text(txt)
-
-
-def referral(update: Update, context: CallbackContext):
-    user = update.effective_user
-    rows = db_query('SELECT referrals, balance FROM users WHERE user_id=?', (user.id,))
-    if not rows:
-        update.message.reply_text('প্রথমে /start করুন।')
-        return
-    referrals, balance = rows[0]
-    bot_username = context.bot.username
-    ref_link = f'https://t.me/{bot_username}?start={user.id}'
-    update.message.reply_text(f'রেফারাল লিংক:\n{ref_link}\nরেফারাল সংখ্যা: {referrals}\nব্যালেন্স: {balance} {CURRENCY}')
-
-
-def balance(update: Update, context: CallbackContext):
-    user = update.effective_user
-    rows = db_query('SELECT balance FROM users WHERE user_id=?', (user.id,))
-    if not rows:
-        update.message.reply_text('প্রথমে /start করুন।')
-        return
-    balance = rows[0][0]
-    update.message.reply_text(f'আপনার ব্যালেন্স: {balance} {CURRENCY}')
-
-
 def earn(update: Update, context: CallbackContext):
-    # demo function to credit user's account
     user = update.effective_user
     rows = db_query('SELECT balance FROM users WHERE user_id=?', (user.id,))
     if not rows:
         update.message.reply_text('প্রথমে /start করুন।')
         return
+
+    # ইউজারকে ওয়েবলিংক পাঠানো হবে
+    site_link = f"https://yourdomain.com/earn.html?uid={user.id}"
+    update.message.reply_text(
+        f"🎥 নিচের লিংকে ক্লিক করে অ্যাড দেখুন এবং ইনকাম করুন:\n{site_link}\n\nঅ্যাড দেখা শেষ হলে বট স্বয়ংক্রিয়ভাবে ইনকাম যোগ করবে।"
+    )here
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8">
+  <title>Watch Ads & Earn</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="//libtl.com/sdk.js" data-zone="9978537" data-sdk="show_9978537"></script>
+  <style>
+    body { font-family: Arial; text-align: center; padding: 40px; background: #fafafa; }
+    button { background: #0088cc; color: white; padding: 15px 25px; border: none; border-radius: 8px; font-size: 18px; }
+  </style>
+</head>
+<body>
+  <h2>🎬 অ্যাড দেখে ইনকাম করুন</h2>
+  <p>অ্যাড দেখা শুরু করতে নিচের বাটনে ক্লিক করুন</p>
+  <button onclick="startAd()">👉 Watch Ad</button>
+
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const uid = urlParams.get("uid");
+
+    function startAd() {
+      show_9978537('pop').then(() => {
+          alert("✅ অ্যাড সম্পূর্ণ দেখেছেন! আপনার ইনকাম যুক্ত হবে।");
+          // Telegram বটে API কল (simple webhook call)
+          fetch(`https://your-server.com/reward?uid=${uid}`)
+      }).catch(e => {
+          alert("❌ অ্যাড লোড হয়নি, আবার চেষ্টা করুন।");
+      });
+    }
+  </script>
+</body>
+</html>
+from flask import Flask, request
+app = Flask(__name__)
+
+@app.route("/reward")
+def reward_user():
+    uid = request.args.get("uid")
+    if not uid:
+        return "missing uid", 400
     now = datetime.utcnow().isoformat()
-    db_execute('UPDATE users SET balance = balance + ? WHERE user_id=?', (EARN_AMOUNT, user.id))
-    db_execute('INSERT INTO earnings (user_id, amount, reason, created_at) VALUES (?,?,?,?)', (user.id, EARN_AMOUNT, 'demo earn', now))
-    update.message.reply_text(f'আপনি পেয়েছেন {EARN_AMOUNT} {CURRENCY} (ডেমো)। /balance দেখে নিজের ব্যালেন্স দেখুন।')
+    amount = 3  # প্রতি অ্যাডে ইনকাম
+    db_execute('UPDATE users SET balance = balance + ? WHERE user_id=?', (amount, uid))
+    db_execute('INSERT INTO earnings (user_id, amount, reason, created_at) VALUES (?,?,?,?)',
+               (uid, amount, 'watched ad', now))
+    return "ok"
 
+if __name__ == "__main__":
+    from threading import Thread
+    Thread(target=main).start()
+    app.run(host="0.0.0.0", port=8000)
 
-def withdraw(update: Update, context: CallbackContext):
-    user = update.effective_user
-    rows = db_query('SELECT balance FROM users WHERE user_id=?', (user.id,))
-    if not rows:
-        update.message.reply_text('প্রথমে /start করুন।')
-        return
-    if len(context.args) < 2:
-        update.message.reply_text('ব্যবহার: /withdraw <amount> <payment_info>\nউদাহরণ: /withdraw 50 bkash:017xxxx')
-        return
-    try:
-        amount = float(context.args[0])
-    except:
-        update.message.reply_text('দয়া করে সঠিক সংখ্যা লিখুন।')
-        return
-    payment_info = ' '.join(context.args[1:])
-    balance = rows[0][0]
-    if amount <= 0 or amount > balance:
-        update.message.reply_text('আপনার ব্যালেন্স অপ্রতুল।')
-        return
-    now = datetime.utcnow().isoformat()
-    wid = db_execute('INSERT INTO withdrawals (user_id, amount, payment_info, requested_at) VALUES (?,?,?,?)', (user.id, amount, payment_info, now))
-    db_execute('UPDATE users SET balance = balance - ? WHERE user_id=?', (amount, user.id))
-    update.message.reply_text(f'আপনার উইথড্র রিকোয়েস্ট গ্রহণ করা হয়েছে। রিকোয়েস্ট আইডি: {wid}. অ্যাডমিন অনুমোদন করলে পেমেন্ট হবে।')
-    # notify admin
-    try:
-        context.bot.send_message(ADMIN_ID, text=f'New withdrawal request #{wid}\nUser: {user.id}\nAmount: {amount} {CURRENCY}\nInfo: {payment_info}')
-    except Exception as e:
-        logger.warning('cannot notify admin: %s', e)
-
-
-@admin_only
-def withdrawals(update: Update, context: CallbackContext):
-    rows = db_query("SELECT id, user_id, amount, payment_info, status, requested_at FROM withdrawals WHERE status='pending' ORDER BY requested_at DESC")
-    if not rows:
-        update.message.reply_text('কোনো pending উইথড্র নেই।')
-        return
-    txt = 'Pending withdrawals:\n'
-    for r in rows:
-        txt += f'ID: {r[0]} | User: {r[1]} | {r[2]} {CURRENCY} | {r[3]} | {r[5]}\n'
-    update.message.reply_text(txt)
-
-
-@admin_only
-def approve(update: Update, context: CallbackContext):
-    if len(context.args) < 1:
-        update.message.reply_text('ব্যবহার: /approve <withdrawal_id>')
-        return
-    try:
-        wid = int(context.args[0])
-    except:
-        update.message.reply_text('সঠিক ID দিন।')
-        return
-    rows = db_query('SELECT user_id, amount, status FROM withdrawals WHERE id=?', (wid,))
-    if not rows:
-        update.message.reply_text('আইডি পাওয়া যায়নি।')
-        return
-    user_id, amount, status = rows[0]
-    if status != 'pending':
-        update.message.reply_text('এই রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে।')
-        return
-    now = datetime.utcnow().isoformat()
-    db_execute('UPDATE withdrawals SET status=?, processed_at=? WHERE id=?', ('approved', now, wid))
-    update.message.reply_text(f'Withdrawal #{wid} অনুমোদিত।')
-    try:
-        context.bot.send_message(user_id, text=f'আপনার উইথড্র রিকোয়েস্ট #{wid} অনুমোদিত। পরবর্তী ধাপে পেমেন্ট করুন (ম্যানেuয়াল)।')
-    except Exception as e:
-        logger.warning('cannot message user after approve: %s', e)
-
-
-def unknown(update: Update, context: CallbackContext):
-    update.message.reply_text('দুঃখিত, আমি বুঝিনি। /help দেখুন।')
-
-
-# ---------- Main setup ----------------
-
-def main():
-    if not BOT_TOKEN or BOT_TOKEN.startswith('REPLACE'):
-        print('Please set your BOT_TOKEN in the file or environment variable BOT_TOKEN')
-        return
-    init_db()
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler('start', start, pass_args=True))
-    dp.add_handler(CommandHandler('help', help_cmd))
-    dp.add_handler(CommandHandler('referral', referral))
-    dp.add_handler(CommandHandler('balance', balance))
-    dp.add_handler(CommandHandler('earn', earn))
-    dp.add_handler(CommandHandler('withdraw', withdraw, pass_args=True))
-    dp.add_handler(CommandHandler('withdrawals', withdrawals))
-    dp.add_handler(CommandHandler('approve', approve, pass_args=True))
-    dp.add_handler(MessageHandler(Filters.command, unknown))
-
-    print('Bot started... Press Ctrl+C to stop')
-    updater.start_polling()
-    updater.idle()
-
-
-if __name__ == '__main__':
-    main()
